@@ -1,0 +1,647 @@
+#!/usr/bin/env node
+
+const stx_common = require("@stacks/common");
+
+// disable debug logging
+let stacksConfig = stx_common.config;
+stacksConfig.logLevel = "none";
+
+const stacksAuth = require('@stacks/auth');
+const walletSdk = require('@stacks/wallet-sdk');
+const stx = require("@stacks/transactions");
+const stacksEncryption = require("@stacks/encryption");
+
+const jwt = require('jsontokens');
+const TokenSigner = jwt.TokenSigner;
+
+const process = require('node:process');
+const fs = require('node:fs');
+
+let DEBUG = true;
+const DEFAULT_NODE = "http://seed-0.mainnet.stacks.co:20443"
+const DEFAULT_HUB = "https://hub.blockstack.org"
+
+function debug(msg) {
+  if (DEBUG) {
+    console.error(msg);
+  }
+}
+
+const BURN_MAINNET = 'SP000000000000000000002Q6VF78';
+const BURN_TESTNET = 'ST000000000000000000002AMW42H';
+
+function getBurnAddress(mainnet) {
+  if (mainnet) {
+    return BURN_MAINNET;
+  }
+  else {
+    return BURN_TESTNET;
+  }
+}
+
+function getTxVersion(mainnet) {
+  if (mainnet) {
+    return stx_common.TransactionVersion.Mainnet;
+  }
+  else {
+    return stx_common.TransactionVersion.Testnet;
+  }
+}
+
+// argv: string[]: list of arguments to parse
+// opts: string: getopt(3)-style short options
+// longOpts: object: long option names keyed to short option characters in opts
+function getCLIOpts(argv, opts, longOpts) {
+  const optsTable = {};
+  const remainingArgv = [];
+  const argvBuff = argv.slice(0);
+
+  for (let i = 0; i < opts.length; i++) {
+    if (opts[i] == ':') {
+      continue;
+    }
+    if (i + 1 < opts.length && opts[i + 1] === ':') {
+      optsTable[opts[i]] = null;
+    } else {
+      optsTable[opts[i]] = false;
+    }
+  }
+
+  for (const opt of Object.keys(optsTable)) {
+    for (let i = 0; i < argvBuff.length; i++) {
+      if (argvBuff[i] === null) {
+        break;
+      }
+      if (argvBuff[i] === '--') {
+        break;
+      }
+
+      const argvOpt = `-${opt}`;
+      const longOptName = longOpts[opt] !== undefined ? longOpts[opt] : '';
+      const longOpt = `--${longOpts[longOptName]}`;
+      if (argvOpt === argvBuff[i] || longOpt === argvBuff[i]) {
+        if (optsTable[opt] === false) {
+          // boolean switch
+          optsTable[opt] = true;
+          argvBuff[i] = '';
+        } else {
+          // argument
+          optsTable[opt] = argvBuff[i + 1];
+          argvBuff[i] = '';
+          argvBuff[i + 1] = '';
+        }
+      }
+    }
+  }
+
+  for (let i = 0; i < argvBuff.length; i++) {
+    if (argvBuff[i].length > 0) {
+      if (argvBuff[i] === '--') {
+        continue;
+      }
+      remainingArgv.push(argvBuff[i]);
+    }
+  }
+
+  optsTable['_'] = remainingArgv;
+  return optsTable;
+}
+
+function usageSignIn(isPublic) {
+  let cmd;
+  if (isPublic) {
+    cmd = "signin-public";
+  }
+  else {
+    cmd = "signin-private";
+  }
+
+  console.error(
+    `Usage: ${process.argv[1]} ${cmd} [options] bnsName appOrigin\n` +
+    `Where [options] are\n` +
+    '   -a, --num-accounts N            Number of accounts to search for `bnsName`. Default is 5.\n' +
+    `   -h, --hub URL                   Gaia hub write endpoint. Default is ${DEFAULT_HUB}\n` +
+    `   -n, --stacks-node URL           Stacks node RPC endpoint. Default is ${DEFAULT_NODE}\n` +
+    '   -p, --transit-public-key TEXT   Public key to encrypt sensitive data with.\n' +
+    '   -s, --seed-phrase TEXT          BIP39 seed phrase. If - is passed, then it is read from stdin.\n' +
+    '   -t, --testnet                   Query with testnet addresses.'
+  );
+  if (!isPublic) {
+    console.error(
+      '   -i, --hub-info JSON             Supply Gaia hub info directly.'
+    );
+  }
+  process.exit(1);
+}
+
+function usageMakeGaiaAuth() {
+  console.error(
+    `Usage: ${process.argv[1]} gaia-auth [options] bnsName appOrigin recipientPublicKey [scope domain [scope domain...]]\n` +
+    `Where [options] are \n` +
+    '   -a, --num-accounts N            Number of accounts to search for `bnsName`. Default is 5.\n' +
+    `   -h, --hub URL                   Gaia hub write endpoint. Default is ${DEFAULT_HUB}\n` +
+    `   -n, --stacks-node URL           Stacks node RPC endpoint. Default is ${DEFAULT_NODE}\n` +
+    '   -s, --seed-phrase TEXT          BIP39 seed phrase. If - is passed, then it is read from stdin.\n' +
+    '   -t, --testnet                   Query with testnet addresses.\n' +
+    '\n' +
+    'The `recipientPublicKey` argument must be a compressed hex-encoded secp256k1 public key.\n' +
+    'Each `scope` must have a paired `domain`. These control what the bearer of this token is allowed to do.\n' +
+    'Valid scopes and domains are:\n' +
+    '\n' +
+    '   __scope__             __domain__      __meaning__\n' +
+    '   putFile                <path>         Bearer can write a file to this path.\n' +
+    '   putFilePrefix          <path-prefix>  Bearer can write any file with this prefix.\n' +
+    '   deleteFile             <path>         Bearer can delete a file to this path.\n' +
+    '   deleteFilePrefix       <path-prefix>  Bearer can delete any file with this prefix.\n' +
+    '   putFileArchival        <path>         Bearer can write to this path, but overwritten data will be backed up instead.\n' +
+    '   putFileArchivalPrefix  <path-prefix>  Bearer can write to any file with this path, but overwritten data will be backed up instead.\n'
+  );
+  process.exit(1);
+}
+
+function usageSubcommands() {
+  console.error(
+    `Usage: ${process.argv[1]} subcommand [options] args...\n` +
+    `Where \`subcommand\` is any of the following:\n` +
+    `   signin-public\n` +
+    `       Generate an authentication response for signing into an application, and update the\n` +
+    `       user's profile with the application's public Gaia bucket.\n` +
+    `\n` +
+    `   signin-private\n` +
+    `       Generate an authentication response for signing into an application, but do NOT update\n` +
+    `       the user's profile.\n` +
+    '\n' +
+    '   gaia-auth\n' +
+    '       Generate a Gaia authentication token, possibly for another user.\n' 
+  );
+  process.exit(1);
+}
+
+function doHelp(subcommand) {
+  if (subcommand === "signin-public") {
+    usageSignIn(true);
+  }
+  else if (subcommand === "signin-private") {
+    usageSignIn(false);
+  }
+  else {
+    usageSubcommands();
+  }
+}
+
+
+function getSeedPhrase(phrase) {
+  if (phrase === '-') {
+    const phrase = fs.readFileSync(0, { encoding: 'utf8' });
+    return phrase.trim();
+  }
+  else {
+    return phrase;
+  }
+}
+
+// Call a read-only function 
+async function readOnlyContractCall(node, contract_addr, contract_name, function_name, function_args, mainnet) {
+  const url = `${node}/v2/contracts/call-read/${contract_addr}/${contract_name}/${function_name}`;
+  const body = {
+    sender: getBurnAddress(mainnet),
+    arguments: function_args.map(function(arg) {
+      return stx.serializeCV(arg).toString('hex')
+    })
+  };
+
+  let res;
+  let data;
+
+  try {
+    res = await fetch(url, {
+      method: 'post',
+      body: JSON.stringify(body),
+      headers: { 'content-type': 'application/json' }
+    });
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+
+  try {
+    data = await res.json();
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+
+  const encodedCV = data.result;
+  return stx.deserializeCV(encodedCV);
+}
+
+// Resolve the name owned by a principal
+async function resolvePrincipal(address, node, mainnet) {
+  let cvOwner;
+  if (address.indexOf(".") >= 0) {
+    const parts = address.split(".");
+    if (parts.length !== 2) {
+      throw new Error("Invalid contract address: multiple '.'");
+    }
+    const addr = parts[0];
+    const name = parts[1];
+    cvOwner = stx.contractPrincipalCV(addr, name);
+  }
+  else {
+    cvOwner = stx.standardPrincipalCV(address);
+  }
+  const args = [
+    cvOwner
+  ];
+
+  let res = await readOnlyContractCall(node, getBurnAddress(mainnet), "bns", "resolve-principal", args, mainnet);
+  res = stx.cvToJSON(res);
+
+  if (res['success']) {
+    const name = Buffer.from(res.value.value['name'].value.slice(2), 'hex').toString();
+    const namespace = Buffer.from(res.value.value['namespace'].value.slice(2), 'hex').toString();
+    res = {
+      "name": `${name}.${namespace}`
+    }
+  }
+  else {
+    res = {
+      'error': "Failed to resolve principal",
+      'code': parseInt(res.value.value['code'].value)
+    }
+  }
+
+  return res;
+}
+
+// Enumerate all owned names in accounts indexed at [start, start+count).
+// Use `(principal-resolve)` to determine ownership by this key.
+async function findNames(wallet, start, count, node, mainnet) {
+  let nameList = [];
+  for (let i = 0; i < start; i++) {
+    walletSdk.generateNewAccount(wallet);
+  }
+  for (let i = start; i < start+count; i++) {
+    const account = wallet.accounts[i];
+
+    // NOTE: this is not backwards-compatible with Stacks 1.0.
+    // This only works with names that live on your STX address.
+    const stxAddress = stx.getAddressFromPrivateKey(account.stxPrivateKey, getTxVersion(mainnet));
+    const res = await resolvePrincipal(stxAddress, node, mainnet);
+    if (res.error) {
+      nameList.push({
+        "address": stxAddress,
+        "index": i,
+      })
+    }
+    else {
+      nameList.push({
+        "name": `${res.name}`,
+        "address": stxAddress,
+        "index": i
+      })
+    }
+    wallet = walletSdk.generateNewAccount(wallet);
+  }
+
+  return nameList;
+}
+
+// Get an app private key from a wallet at a given account index for a given app origin
+async function getAppPrivateKey(wallet, account_index, app_origin) {
+  for (let i = 0; i < account_index; i++) {
+    wallet = walletSdk.generateNewAccount(wallet);
+  }
+  const account = wallet.accounts[account_index];
+  const appKey = walletSdk.getAppPrivateKey({
+    account,
+    appDomain: app_origin
+  });
+  return appKey;
+}
+
+// Get /hub_info
+async function getHubInfo(gaiaHubUrl) {
+  const response = await fetch(`${gaiaHubUrl}/hub_info`);
+  const data = await response.json();
+  return data;
+};
+
+// Make a Gaia association token
+function makeGaiaAssociationToken(hubInfo, privateKey, gaiaHubUrl, childPublicKeyHex) {
+  const LIFETIME_SECONDS = 365 * 24 * 3600;
+  const signerKeyHex = privateKey.slice(0, 64);
+  const compressedPublicKeyHex = stacksEncryption.getPublicKeyFromPrivate(signerKeyHex);
+  const salt = stacksEncryption.randomBytes(16).toString('hex');
+  const payload = {
+    childToAssociate: childPublicKeyHex,
+    iss: compressedPublicKeyHex,
+    exp: LIFETIME_SECONDS + new Date().getTime() / 1000,
+    iat: Date.now() / 1000,
+    salt,
+  };
+  const challengeText = hubInfo.challenge_text;
+  if (challengeText) {
+    payload.gaiaChallenge = challengeText;
+  }
+
+  const tokenSigner = new TokenSigner('ES256K', signerKeyHex);
+  const token = tokenSigner.sign(payload);
+  return `v1:${token}`;
+};
+
+// Sign into an app privately.
+// Does *not* update the profile.
+// If `hubInfo` is given, then the Gaia hub won't even be contacted.
+async function signInPrivateAuth(wallet, account_index, transit_public_key, app_origin, gaia_hub_url, hubInfo) {
+  if (hubInfo === undefined) {
+    hubInfo = await getHubInfo(gaia_hub_url);
+  }
+  for (let i = 0; i < account_index; i++) {
+    wallet = walletSdk.generateNewAccount(wallet);
+  }
+  const account = wallet.accounts[account_index];
+  const appPrivateKey = await getAppPrivateKey(wallet, account_index, app_origin);
+  const compressedAppPublicKey = stacksEncryption.getPublicKeyFromPrivate(appPrivateKey.slice(0, 64));
+  const associationToken = makeGaiaAssociationToken(hubInfo, account.dataPrivateKey, gaia_hub_url, compressedAppPublicKey);
+  try {
+    const resp = await stacksAuth.makeAuthResponse(
+      account.dataPrivateKey,
+      {
+        stxAddress: {
+          testnet: walletSdk.getStxAddress({ account, transactionVersion: stx_common.TransactionVersion.Testnet }),
+          mainnet: walletSdk.getStxAddress({ account, transactionVersion: stx_common.TransactionVersion.Mainnet }),
+        }
+      },
+      {
+        profileUrl: "http://example.com",
+      },
+      undefined,
+      appPrivateKey,
+      undefined,
+      transit_public_key,
+      gaia_hub_url,
+      undefined,
+      associationToken,
+      undefined
+    );
+    return jwt.decodeToken(resp);
+  }
+  catch (error) {
+    console.error(error);
+    return undefined;
+  }
+}
+
+// Sign into an app publicly
+// Updates the profile to list the app
+async function signInPublicAuth(wallet, account_index, transit_public_key, app_origin, gaia_hub_url) {
+  for (let i = 0; i < account_index; i++) {
+    wallet = walletSdk.generateNewAccount(wallet);
+  }
+  const account = wallet.accounts[account_index];
+  const resp = await walletSdk.makeAuthResponse({
+    account,
+    appDomain: app_origin,
+    transitPublicKey: transit_public_key,
+    scopes: ["publish_data"],
+    gaiaHubUrl: gaia_hub_url,
+  });
+  return jwt.decodeToken(resp);
+}
+
+// Make a scoped Gaia auth token
+// scopes is a list of [{'scope': <scope str>, 'domain': <domain str>}]
+function makeScopedGaiaAuthToken(hubInfo, signerKeyHex, hubUrl, scopes, associationToken) {
+  const challengeText = hubInfo.challenge_text;
+  const iss = stacksEncryption.getPublicKeyFromPrivate(signerKeyHex);
+  const salt = stacksEncryption.randomBytes(16).toString('hex');
+  let payload = {
+    gaiaChallenge: challengeText,
+    hubUrl,
+    iss,
+    salt,
+    scopes
+  };
+  if (associationToken) {
+    payload.associationToken = associationToken
+  }
+
+  const token = new TokenSigner('ES256K', signerKeyHex).sign(payload);
+  return `v1:${token}`;
+}
+
+async function makeGaiaAuthToken(wallet, account_index, app_origin, gaia_hub_url, publicKey, scopes) {
+  const hubInfo = await getHubInfo(gaia_hub_url);
+  for (let i = 0; i < account_index; i++) {
+    wallet = walletSdk.generateNewAccount(wallet);
+  }
+  const account = wallet.accounts[account_index];
+  const associationToken = makeGaiaAssociationToken(hubInfo, account.dataPrivateKey, gaia_hub_url, publicKey);
+  const tok = makeScopedGaiaAuthToken(hubInfo, account.dataPrivateKey, gaia_hub_url, scopes, associationToken);
+  return tok;
+}
+
+// Do a sign-in
+async function innerSignIn(argv, isPublic) {
+  const opts = getCLIOpts(argv, "s:h:n:a:t:p:i:", {
+    "s": "seed-phrase",
+    "n": "stacks-node",
+    "h": "hub",
+    "a": "num-accounts",
+    "t": "testnet",
+    "p": "transit-public-key",
+    "i": "hub-info"
+  });
+
+  if (opts['s'] === null) {
+    usageSignIn(isPublic);
+  }
+  if (opts['n'] === null) {
+    opts['n'] = DEFAULT_NODE;
+  }
+  if (opts['h'] === null) {
+    opts['h'] = DEFAULT_HUB;
+  }
+  if (opts['a'] === null) {
+    opts['a'] = "5";
+  }
+  if (opts['p'] === null) {
+    // private key is 34cae85297cf34116138b934c6c6658ab4309a8115eb5dc427b64e32cf836f1101
+    opts['p'] = "025ddf4e86e56b486573b97e9799d59d2b099bd7635e5db38afbbcae8688fc0fb2";
+  }
+
+  if (opts['_'].length != 2) {
+    usageSignIn(isPublic);
+  }
+
+  const phrase = getSeedPhrase(opts['s']);
+  const hub = opts['h'];
+  const node = opts['n'];
+  const numAccounts = parseInt(opts['a']);
+  const bnsName = opts['_'][0];
+  const appOrigin = opts['_'][1];
+  const mainnet = !opts['t'];
+  const transitPublicKey = opts['p'];
+  let hubInfo = opts['i'];
+
+  if (hubInfo) {
+    hubInfo = JSON.parse(hubInfo);
+  }
+
+  const wallet = await walletSdk.generateWallet({
+    secretKey: phrase,
+    password: phrase
+  });
+
+  const names = await findNames(wallet, 0, numAccounts, node, mainnet);
+  let walletIndex = -1;
+  for (let namerec of names) {
+    if (namerec.name === bnsName) {
+      walletIndex = namerec.index;
+      break;
+    }
+  }
+  if (walletIndex < 0) {
+    console.error(`No name records found for accounts 0..${numAccounts}. Try passing -a with a larger value.`);
+    return undefined;
+  }
+
+  let token;
+  if (isPublic) {
+    token = await signInPublicAuth(wallet, walletIndex, transitPublicKey, appOrigin, hub);
+  }
+  else {
+    token = await signInPrivateAuth(wallet, walletIndex, transitPublicKey, appOrigin, hub, hubInfo);
+  }
+
+  return token;
+}
+
+async function signInPublic(argv) {
+  const res = await innerSignIn(argv, true);
+  return res;
+}
+
+async function signInPrivate(argv) {
+  const res = await innerSignIn(argv, false);
+  return res;
+}
+
+async function makeGaiaAuth(argv) {
+  const opts = getCLIOpts(argv, "s:h:n:a:t:", {
+    "s": "seed-phrase",
+    "n": "stacks-node",
+    "h": "hub",
+    "a": "num-accounts",
+    "t": "testnet",
+  });
+  
+  if (opts['s'] === null) {
+    usageMakeGaiaAuth();
+  }
+  if (opts['n'] === null) {
+    opts['n'] = DEFAULT_NODE;
+  }
+  if (opts['h'] === null) {
+    opts['h'] = DEFAULT_HUB;
+  }
+  if (opts['a'] === null) {
+    opts['a'] = "5";
+  }
+
+  if (opts['_'].length < 3) {
+    console.error("Missing required arguments");
+    usageMakeGaiaAuth();
+  }
+
+  const phrase = getSeedPhrase(opts['s']);
+  const hub = opts['h'];
+  const node = opts['n'];
+  const numAccounts = parseInt(opts['a']);
+  const mainnet = !opts['t'];
+  
+  const bnsName = opts['_'][0];
+  const appOrigin = opts['_'][1];
+  const recipientPublicKey = opts['_'][2];
+  const scopesAndDomains = opts['_'].slice(3);
+
+  if (scopesAndDomains.length % 2 !== 0) {
+    console.error("Bad scopes list");
+    usageMakeGaiaAuth();
+  }
+
+  const wallet = await walletSdk.generateWallet({
+    secretKey: phrase,
+    password: phrase
+  });
+
+  const names = await findNames(wallet, 0, numAccounts, node, mainnet);
+  let walletIndex = -1;
+  for (let namerec of names) {
+    if (namerec.name === bnsName) {
+      walletIndex = namerec.index;
+      break;
+    }
+  }
+  if (walletIndex < 0) {
+    console.error(`No name records found for accounts 0..${numAccounts}. Try passing -a with a larger value.`);
+    const res = {
+      "error": "No name records found for accounts searched",
+      "searched": numAccounts
+    };
+    return res;
+  }
+
+  if (recipientPublicKey.length !== 66) {
+    console.error("Bad recipientPublicKey");
+    usageMakeGaiaAuth();
+  }
+
+  const allowed_scopes = [
+    "putFile", "putFilePrefix",
+    "deleteFile", "deleteFilePrefix",
+    "putFileArchival", "putFileArchivalPrefix"
+  ];
+
+  let scopeList = [];
+  for (let i = 0; i < scopesAndDomains.length / 2; i++) {
+    const scope = scopesAndDomains[2*i];
+    const domain = scopesAndDomains[2*i+1];
+
+    if (allowed_scopes.indexOf(scope) < 0) {
+      usageMakeGaiaAuth();
+    }
+    scopeList.push({
+      scope: scope,
+      domain: domain
+    });
+  }
+
+  const token = await makeGaiaAuthToken(wallet, walletIndex, appOrigin, hub, recipientPublicKey, scopeList);
+  return token;
+}
+
+async function main() {
+  const argv = process.argv.slice(1);
+  const subcommand = argv[1];
+  if (subcommand === "signin-public") {
+    const res = await signInPublic(argv.slice(2));
+    console.log(JSON.stringify(res));
+  }
+  else if (subcommand === "signin-private") {
+    const res = await signInPrivate(argv.slice(2));
+    console.log(JSON.stringify(res));
+  }
+  else if (subcommand === "gaia-auth") {
+    const res = await makeGaiaAuth(argv.slice(2));
+    console.log(JSON.stringify(res));
+  }
+  else {
+    doHelp(argv[2]);
+  }
+}
+
+main()
