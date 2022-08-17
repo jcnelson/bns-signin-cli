@@ -134,17 +134,7 @@ function usageSignIn(isPublic) {
   process.exit(1);
 }
 
-function usageMakeGaiaAuth() {
-  console.error(
-    `Usage: ${process.argv[1]} gaia-auth [options] bnsName appOrigin recipientPublicKey [scope domain [scope domain...]]\n` +
-    `Where [options] are \n` +
-    '   -a, --num-accounts N            Number of accounts to search for `bnsName`. Default is 5.\n' +
-    `   -h, --hub URL                   Gaia hub write endpoint. Default is ${DEFAULT_HUB}\n` +
-    `   -n, --stacks-node URL           Stacks node RPC endpoint. Default is ${DEFAULT_NODE}\n` +
-    '   -s, --seed-phrase TEXT          BIP39 seed phrase. If - is passed, then it is read from stdin.\n' +
-    '   -t, --testnet                   Query with testnet addresses.\n' +
-    '\n' +
-    'The `recipientPublicKey` argument must be a compressed hex-encoded secp256k1 public key.\n' +
+const SCOPES_DOCS = 
     'Each `scope` must have a paired `domain`. These control what the bearer of this token is allowed to do.\n' +
     'Valid scopes and domains are:\n' +
     '\n' +
@@ -154,7 +144,38 @@ function usageMakeGaiaAuth() {
     '   deleteFile             <path>         Bearer can delete a file to this path.\n' +
     '   deleteFilePrefix       <path-prefix>  Bearer can delete any file with this prefix.\n' +
     '   putFileArchival        <path>         Bearer can write to this path, but overwritten data will be backed up instead.\n' +
-    '   putFileArchivalPrefix  <path-prefix>  Bearer can write to any file with this path, but overwritten data will be backed up instead.\n'
+    '   putFileArchivalPrefix  <path-prefix>  Bearer can write to any file with this path, but overwritten data will be backed up instead.\n';
+
+function usageMakeGaiaAuth() {
+  console.error(
+    `Usage: ${process.argv[1]} gaia-auth [options] bnsName appOrigin associationToken [scope domain [scope domain...]]\n` +
+    `Where [options] are \n` +
+    '   -a, --num-accounts N            Number of accounts to search for `bnsName`. Default is 5.\n' +
+    `   -h, --hub URL                   Gaia hub write endpoint. Default is ${DEFAULT_HUB}\n` +
+    `   -n, --stacks-node URL           Stacks node RPC endpoint. Default is ${DEFAULT_NODE}\n` +
+    '   -s, --seed-phrase TEXT          BIP39 seed phrase. If - is passed, then it is read from stdin.\n' +
+    '   -t, --testnet                   Query with testnet addresses.\n' +
+    '\n' +
+    'The `associationToken` argument can be generated with the `gaia-assoc` command.\n' +
+    '\n' +
+    SCOPES_DOCS
+  );
+  process.exit(1);
+}
+
+function usageMakeGaiaAssoc() {
+  console.error(
+    `Usage: ${process.argv[1]} gaia-assoc [options] bnsName recipientPublicKey [scope domain [scope domain...]]\n` +
+    `Where [options] are \n` +
+    '   -a, --num-accounts N            Number of accounts to search for `bnsName`. Default is 5.\n' +
+    `   -h, --hub URL                   Gaia hub write endpoint. Default is ${DEFAULT_HUB}\n` +
+    `   -n, --stacks-node URL           Stacks node RPC endpoint. Default is ${DEFAULT_NODE}\n` +
+    '   -s, --seed-phrase TEXT          BIP39 seed phrase. If - is passed, then it is read from stdin.\n' +
+    '   -t, --testnet                   Query with testnet addresses.\n' +
+    '\n' +
+    'The `recipientPublicKey` argument must be a compressed hex-encoded secp256k1 public key.\n' +
+    '\n' +
+    SCOPES_DOCS
   );
   process.exit(1);
 }
@@ -172,7 +193,11 @@ function usageSubcommands() {
     `       the user's profile.\n` +
     '\n' +
     '   gaia-auth\n' +
-    '       Generate a Gaia authentication token, possibly for another user.\n' 
+    '       Generate a Gaia authentication token.\n' +
+    '\n' +
+    '   gaia-assoc\n' +
+    '       Generate a Gaia association token, possibly for another user.\n' +
+    '\n'
   );
   process.exit(1);
 }
@@ -330,7 +355,8 @@ async function getHubInfo(gaiaHubUrl) {
 };
 
 // Make a Gaia association token
-function makeGaiaAssociationToken(hubInfo, privateKey, gaiaHubUrl, childPublicKeyHex) {
+// scopes is a list of [{'scope': <scope str>, 'domain': <domain str>}]
+function makeGaiaAssociationToken(hubInfo, privateKey, gaiaHubUrl, childPublicKeyHex, scopes) {
   const LIFETIME_SECONDS = 365 * 24 * 3600;
   const signerKeyHex = privateKey.slice(0, 64);
   const compressedPublicKeyHex = stacksEncryption.getPublicKeyFromPrivate(signerKeyHex);
@@ -341,6 +367,7 @@ function makeGaiaAssociationToken(hubInfo, privateKey, gaiaHubUrl, childPublicKe
     exp: LIFETIME_SECONDS + new Date().getTime() / 1000,
     iat: Date.now() / 1000,
     salt,
+    scopes
   };
   const challengeText = hubInfo.challenge_text;
   if (challengeText) {
@@ -423,8 +450,14 @@ function makeScopedGaiaAuthToken(hubInfo, signerKeyHex, hubUrl, scopes, associat
     hubUrl,
     iss,
     salt,
-    scopes
   };
+  if (!!scopes) {
+    payload.scopes = scopes;
+  }
+  else {
+    payload.scopes = [];
+  }
+
   if (associationToken) {
     payload.associationToken = associationToken
   }
@@ -433,14 +466,27 @@ function makeScopedGaiaAuthToken(hubInfo, signerKeyHex, hubUrl, scopes, associat
   return `v1:${token}`;
 }
 
-async function makeGaiaAuthToken(wallet, account_index, app_origin, gaia_hub_url, publicKey, scopes) {
+// Create a scoped Gaia association token
+async function makeScopedGaiaAssociationToken(wallet, account_index, app_origin, gaia_hub_url, publicKey, scopes) {
   const hubInfo = await getHubInfo(gaia_hub_url);
   for (let i = 0; i < account_index; i++) {
     wallet = walletSdk.generateNewAccount(wallet);
   }
   const account = wallet.accounts[account_index];
-  const associationToken = makeGaiaAssociationToken(hubInfo, account.dataPrivateKey, gaia_hub_url, publicKey);
-  const tok = makeScopedGaiaAuthToken(hubInfo, account.dataPrivateKey, gaia_hub_url, scopes, associationToken);
+  const appPrivateKey = await getAppPrivateKey(wallet, account_index, app_origin);
+  const associationToken = makeGaiaAssociationToken(hubInfo, account.dataPrivateKey, gaia_hub_url, publicKey, scopes);
+  return associationToken;
+}
+
+/// Create a gaia authentication token with extra scopes on top of those in the association token
+async function makeGaiaAuthToken(wallet, account_index, app_origin, gaia_hub_url, associationToken, extraScopes) {
+  const hubInfo = await getHubInfo(gaia_hub_url);
+  for (let i = 0; i < account_index; i++) {
+    wallet = walletSdk.generateNewAccount(wallet);
+  }
+  const account = wallet.accounts[account_index];
+  const appPrivateKey = await getAppPrivateKey(wallet, account_index, app_origin);
+  const tok = makeScopedGaiaAuthToken(hubInfo, appPrivateKey, gaia_hub_url, extraScopes, associationToken);
   return tok;
 }
 
@@ -530,50 +576,8 @@ async function signInPrivate(argv) {
   return res;
 }
 
-async function makeGaiaAuth(argv) {
-  const opts = getCLIOpts(argv, "s:h:n:a:t:", {
-    "s": "seed-phrase",
-    "n": "stacks-node",
-    "h": "hub",
-    "a": "num-accounts",
-    "t": "testnet",
-  });
-  
-  if (opts['s'] === null) {
-    usageMakeGaiaAuth();
-  }
-  if (opts['n'] === null) {
-    opts['n'] = DEFAULT_NODE;
-  }
-  if (opts['h'] === null) {
-    opts['h'] = DEFAULT_HUB;
-  }
-  if (opts['a'] === null) {
-    opts['a'] = "5";
-  }
-
-  if (opts['_'].length < 3) {
-    console.error("Missing required arguments");
-    usageMakeGaiaAuth();
-  }
-
-  const phrase = getSeedPhrase(opts['s']);
-  const hub = opts['h'];
-  const node = opts['n'];
-  const numAccounts = parseInt(opts['a']);
-  const mainnet = !opts['t'];
-  
-  const bnsName = opts['_'][0];
-  const appOrigin = opts['_'][1];
-  const recipientPublicKey = opts['_'][2];
-  const scopesAndDomains = opts['_'].slice(3);
-
-  if (scopesAndDomains.length % 2 !== 0) {
-    console.error("Bad scopes list");
-    usageMakeGaiaAuth();
-  }
-
-  const wallet = await walletSdk.generateWallet({
+async function getWalletForName(phrase, bnsName, numAccounts, node, mainnet) {
+  let wallet = await walletSdk.generateWallet({
     secretKey: phrase,
     password: phrase
   });
@@ -594,12 +598,19 @@ async function makeGaiaAuth(argv) {
     };
     return res;
   }
-
-  if (recipientPublicKey.length !== 66) {
-    console.error("Bad recipientPublicKey");
-    usageMakeGaiaAuth();
+  for (let i = 0; i < walletIndex; i++) {
+    wallet = walletSdk.generateNewAccount(wallet);
   }
+  const ret = {
+    "wallet": wallet,
+    "index": walletIndex
+  };
+  return ret;
+}
 
+// Parse "scope domain scope domain ..." into [{scope: "scope", domain: "domain", ...}].
+// Returns undefined if an invalid scope is found
+function parseAuthScopes(scopesAndDomains) {
   const allowed_scopes = [
     "putFile", "putFilePrefix",
     "deleteFile", "deleteFilePrefix",
@@ -612,7 +623,7 @@ async function makeGaiaAuth(argv) {
     const domain = scopesAndDomains[2*i+1];
 
     if (allowed_scopes.indexOf(scope) < 0) {
-      usageMakeGaiaAuth();
+      return undefined;
     }
     scopeList.push({
       scope: scope,
@@ -620,7 +631,126 @@ async function makeGaiaAuth(argv) {
     });
   }
 
-  const token = await makeGaiaAuthToken(wallet, walletIndex, appOrigin, hub, recipientPublicKey, scopeList);
+  return scopeList;
+}
+
+async function makeGaiaAuth(argv) {
+  const opts = getCLIOpts(argv, "s:h:n:a:tg:", {
+    "s": "seed-phrase",
+    "n": "stacks-node",
+    "h": "hub",
+    "a": "num-accounts",
+    "t": "testnet",
+    "g": "gaia-association-token"
+  });
+  
+  if (opts['s'] === null) {
+    usageMakeGaiaAuth();
+  }
+  if (opts['n'] === null) {
+    opts['n'] = DEFAULT_NODE;
+  }
+  if (opts['h'] === null) {
+    opts['h'] = DEFAULT_HUB;
+  }
+  if (opts['a'] === null) {
+    opts['a'] = "5";
+  }
+
+  if (opts['_'].length < 2) {
+    console.error("Missing required arguments");
+    usageMakeGaiaAuth();
+  }
+
+  const phrase = getSeedPhrase(opts['s']);
+  const hub = opts['h'];
+  const node = opts['n'];
+  const numAccounts = parseInt(opts['a']);
+  const mainnet = !opts['t'];
+  const associationToken = opts['g'];
+  
+  const bnsName = opts['_'][0];
+  const appOrigin = opts['_'][1];
+  const scopesAndDomains = opts['_'].slice(2);
+
+  if (scopesAndDomains.length % 2 !== 0) {
+    console.error("Bad scopes list");
+    usageMakeGaiaAuth();
+  }
+
+  const walletInfo = await getWalletForName(phrase, bnsName, numAccounts, node, mainnet);
+  const wallet = walletInfo.wallet;
+  const walletIndex = walletInfo.index;
+
+  const scopeList = parseAuthScopes(scopesAndDomains);
+  if (scopeList === undefined) {
+    usageMakeGaiaAuth();
+  }
+
+  const token = await makeGaiaAuthToken(wallet, walletIndex, appOrigin, hub, associationToken, scopeList);
+  return token;
+}
+
+async function makeGaiaAssoc(argv) {
+  const opts = getCLIOpts(argv, "s:h:n:a:t", {
+    "s": "seed-phrase",
+    "n": "stacks-node",
+    "h": "hub",
+    "a": "num-accounts",
+    "t": "testnet",
+  });
+  
+  if (opts['s'] === null) {
+    usageMakeGaiaAssoc();
+  }
+  if (opts['n'] === null) {
+    opts['n'] = DEFAULT_NODE;
+  }
+  if (opts['h'] === null) {
+    opts['h'] = DEFAULT_HUB;
+  }
+  if (opts['a'] === null) {
+    opts['a'] = "5";
+  }
+
+  if (opts['_'].length < 2) {
+    console.error("Missing required arguments");
+    usageMakeGaiaAssoc();
+  }
+
+  const phrase = getSeedPhrase(opts['s']);
+  const hub = opts['h'];
+  const node = opts['n'];
+  const numAccounts = parseInt(opts['a']);
+  const mainnet = !opts['t'];
+  
+  const bnsName = opts['_'][0];
+  const recipientPublicKey = opts['_'][1];
+  const scopesAndDomains = opts['_'].slice(2);
+
+  if (scopesAndDomains.length % 2 !== 0) {
+    console.error("Bad scopes list");
+    usageMakeGaiaAssoc();
+  }
+  
+  const walletInfo = await getWalletForName(phrase, bnsName, numAccounts, node, mainnet);
+  const wallet = walletInfo.wallet;
+  const walletIndex = walletInfo.index;
+
+  const scopeList = parseAuthScopes(scopesAndDomains);
+  if (scopeList === undefined) {
+    usageMakeGaiaAuth();
+  }
+
+  if (recipientPublicKey.length !== 66) {
+    console.error("Bad recipientPublicKey");
+    usageMakeGaiaAssoc();
+  }
+
+  const account = wallet.accounts[walletIndex];
+  const hubInfo = await getHubInfo(hub);
+
+  const token = makeGaiaAssociationToken(hubInfo, account.dataPrivateKey, hub, recipientPublicKey, scopeList);
   return token;
 }
 
@@ -633,6 +763,10 @@ async function main() {
   }
   else if (subcommand === "signin-private") {
     const res = await signInPrivate(argv.slice(2));
+    console.log(JSON.stringify(res));
+  }
+  else if (subcommand === "gaia-assoc") {
+    const res = await makeGaiaAssoc(argv.slice(2));
     console.log(JSON.stringify(res));
   }
   else if (subcommand === "gaia-auth") {
